@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# Stage 1 (SQL dump -> schema.json) uses the Python STANDARD LIBRARY ONLY.
+#   re, json, pathlib, sys  -- nothing to install.
+# This is deliberate: the parser must run anywhere with zero setup.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Stage 2+ dependencies. Install with:  pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+# --- Stage 2 & 5a: local Ollama (descriptions AND embeddings) ---
+ollama                   # python client for a locally running Ollama server
+
+# --- Stage 5a: embed + upsert into Pinecone ---
+pinecone                 # vector DB client (modern package; NOT pinecone-client)
+
+# --- Stage 5b: load the graph into Neo4j ---
+neo4j                    # official Neo4j Python driver
+
+# --- ASK phase: deep SQL validation (alias/column/join-type checks) ---
+sqlglot
+
+# --- ASK phase D: execute validated SQL on a live MySQL ---
+pymysql
+
+# --- secrets: load .env so API keys stay out of git ---
+python-dotenv
