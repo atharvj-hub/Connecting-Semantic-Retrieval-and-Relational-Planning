@@ -24,6 +24,17 @@ venv/
 data/
 logs/
 
+# Internal research — NOT for the public repo
+docs/
+
+# Project-specific benchmark data (bring your own — see README)
+eval/gold.jsonl
+eval/build_gold.py
+eval/results_*.json
+eval/baseline_run.txt
+eval/RESULTS.md
+eval/q10_diag.txt
+
 # Ollama generated files
 models/
 
