@@ -59,6 +59,11 @@ SCHEMA_JSON = OUTPUT_DIR / "schema.json"
 GRAPH_JSON = OUTPUT_DIR / "graph.json"
 SEMANTIC_JSON = OUTPUT_DIR / "semantic.json"
 
+# Hand-authored metric catalog (Tier 0 semantic layer). NOT generated — you edit
+# this by hand to teach the compiler your business metrics. See src/metrics_layer.py.
+# (Unrelated to SEMANTIC_JSON above, which is retrieval embeddings.)
+METRICS_YML = BASE_DIR / "metrics.yml"
+
 # Tables to EXCLUDE from the Pinecone retrieval index (Stage 4a). These are
 # migration/bookkeeping tables (Liquibase) — no business question is ever about
 # them, so indexing them only adds retrieval noise. They stay in schema.json and
@@ -116,3 +121,43 @@ SAMPLE_ROWS = 3
 # Cap on how long a single sample value can be before we truncate it. Some
 # columns (e.g. film.description) hold paragraphs; we only need a hint.
 MAX_VALUE_LEN = 60
+
+# ---------------------------------------------------------------------------
+# M5 semantic cache tunables
+# ---------------------------------------------------------------------------
+# The cache stores validated SQL (not answer text) and RE-EXECUTES on every hit
+# so data is always fresh. TTL controls how long we trust the cached *SQL*
+# before regenerating from scratch. See docs/v2-hardening-plan.md Fix #1.
+CACHE_THRESHOLD = 0.96          # cosine sim to count as the "same" question
+CACHE_HISTORY_TURNS = 2         # prior turns folded into the cache key
+CACHE_MAX_ENTRIES = 500         # FIFO cap; cache_lookup is a linear scan
+
+# TTLs (seconds) — how long we trust the cached SQL, not the data (always fresh).
+CACHE_TTL_VOLATILE = 600        # 10 min  — churny tables (logs, transactions, etc.)
+CACHE_TTL_DEFAULT  = 3600       # 1 hour  — aggregates over non-stable tables
+CACHE_TTL_STABLE   = 86400      # 24 hour — pure lookups on catalog/config tables
+
+# Substring match on table name → volatile (short SQL-trust window).
+CACHE_VOLATILE_PATTERNS = {
+    "log", "transaction", "execution", "session", "event", "wallet",
+    "checkpoint", "cache", "audit", "message", "seq", "state", "lock",
+    "grant", "invoice", "redemption", "conversion", "balance",
+}
+
+# Override: catalog/config tables are stable even if a volatile pattern matched.
+CACHE_STABLE_TABLES = {
+    "plans", "plan_parameter_configs", "plan_stripe_prices", "plugins",
+    "plugin_registrations", "platform_configs", "billing_parameters",
+    "credential_types", "promo_codes", "referral_codes", "trusted_publishers",
+    "tenants", "workspaces",
+}
+
+# ---------------------------------------------------------------------------
+# Fix #5 — EXPLAIN cost-gate
+# ---------------------------------------------------------------------------
+# Estimated rows examined beyond this threshold → refuse execution.
+# Heuristic guard (EXPLAIN estimates lie with stale stats); complemented by
+# MAX_EXECUTION_TIME runtime cap as defense-in-depth.
+EXPLAIN_MAX_ROWS = 1_000_000
+QUERY_TIMEOUT_MS = 10_000                   # runtime cap for SELECT queries
+
