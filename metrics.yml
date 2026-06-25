@@ -1,0 +1,116 @@
+# =============================================================================
+# metrics.yml — the business metric catalog (Tier 0 semantic layer)
+# =============================================================================
+# HAND-AUTHORED. Each entry maps a business word to a verified SQL fragment. The
+# deterministic compiler (src/metrics_layer.py) turns a structured request —
+#     {metric: total_granted_credits, dimensions: [by_tenant], filters: [...]}
+# — into GUARANTEED-correct SQL. No LLM writes the SQL; code assembles it from
+# these verified parts, so it cannot hallucinate a column or botch a join.
+#
+# SEEDED FROM eval/gold.jsonl. This catalog covers the AGGREGATION-shaped gold
+# questions: q01, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q19, q20.
+# (The remaining gold — q02/03/04/15/16/17/18 — are raw lists / single-row
+# lookups, NOT aggregations, so they are out of scope for a metrics layer by
+# design and correctly fall through to the general pipeline.)
+#
+# NOTE: data/output/semantic.json is something ELSE (retrieval embeddings).
+# =============================================================================
+
+# How tables connect (single-hop "star" joins for v0; multi-hop pathfinding is
+# the separate "graph-pathfinding joins" missing-tech item).
+joins:
+  - left: tenant_credit_grants
+    left_key: tenant_id
+    right: tenants
+    right_key: tenant_id
+
+# Metrics = named aggregations. agg ∈ {SUM, COUNT, AVG, MIN, MAX}.
+# expr is a column name, or "*" for COUNT(*).
+metrics:
+  total_granted_credits:                 # q06, q19, q20
+    description: "total credits granted across all grants"
+    table: tenant_credit_grants
+    agg: SUM
+    expr: granted_credits
+  max_granted_credit:                    # q07
+    description: "the highest single granted credit amount"
+    table: tenant_credit_grants
+    agg: MAX
+    expr: granted_credits
+  grant_count:                           # q11
+    description: "number of credit grants"
+    table: tenant_credit_grants
+    agg: COUNT
+    expr: "*"
+  total_credit_transaction_amount:       # q08
+    description: "total amount across all credit transactions"
+    table: tenant_credit_transactions
+    agg: SUM
+    expr: amount
+  plugin_count:                          # q01, q14
+    description: "number of plugins"
+    table: plugins
+    agg: COUNT
+    expr: "*"
+  workflow_count:                        # q05
+    description: "number of workflows"
+    table: workflows
+    agg: COUNT
+    expr: "*"
+  node_execution_count:                  # q09, q13
+    description: "number of node executions"
+    table: node_execution_logs
+    agg: COUNT
+    expr: "*"
+  workflow_execution_count:              # q12
+    description: "number of workflow executions"
+    table: workflow_execution_logs
+    agg: COUNT
+    expr: "*"
+  avg_workflow_duration:                 # q10
+    description: "average duration (ms) of workflow executions"
+    table: workflow_execution_logs
+    agg: AVG
+    expr: duration_ms
+
+# Dimensions = ways to slice a metric (each becomes a SELECT column + GROUP BY).
+# A dimension is tied to ONE table; "status" lives on several tables, so it gets
+# one entry per table (that's the honest curation cost of a hand-authored catalog).
+dimensions:
+  by_tenant:                             # q20
+    description: "grouped by tenant name"
+    table: tenants
+    expr: name
+  by_source:                             # q11
+    description: "grouped by the grant's source"
+    table: tenant_credit_grants
+    expr: source
+  by_metering_key:                       # q19
+    description: "grouped by metering key"
+    table: tenant_credit_grants
+    expr: metering_key
+  by_category:                           # q14
+    description: "grouped by plugin category"
+    table: plugins
+    expr: category
+  by_workflow_status:                    # q12
+    description: "grouped by workflow execution status"
+    table: workflow_execution_logs
+    expr: status
+  by_node_status:                        # q13
+    description: "grouped by node execution status"
+    table: node_execution_logs
+    expr: status
+
+# Filters = reusable predicates. The value is supplied at query time.
+filters:
+  tenant_is:                             # q19
+    description: "restrict to one tenant by name"
+    table: tenants
+    expr: name
+    op: "="
+  node_status_is:                        # q09 (e.g. value 'FAILED')
+    description: "restrict node executions to a status, e.g. FAILED"
+    table: node_execution_logs
+    expr: status
+    op: "="

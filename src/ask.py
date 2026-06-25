@@ -352,6 +352,13 @@ def validate(sql, schema):
                 return cols[real][c.name]
         return None
 
+    # SELECT-list aliases (e.g. COUNT(*) AS workflow_count) are valid names to
+    # reference in ORDER BY / HAVING, but they aren't real schema columns — so
+    # collect them up front and don't flag an unqualified reference to one as a
+    # hallucinated column (this otherwise rejects legitimate "top-N by computed
+    # metric" queries).
+    select_aliases = {a.alias for a in tree.find_all(exp.Alias) if a.alias}
+
     # P1 undefined alias + P3 hallucinated column
     for c in tree.find_all(exp.Column):
         if c.name == "*":
@@ -362,7 +369,8 @@ def validate(sql, schema):
         if q:
             if c.name not in cols[alias2t[q]]:
                 return False, f"column '{c.name}' does not exist in table '{alias2t[q]}'"
-        elif not any(c.name in cols[r] for r in set(alias2t.values())):
+        elif c.name not in select_aliases and \
+                not any(c.name in cols[r] for r in set(alias2t.values())):
             return False, f"column '{c.name}' not found in any table in scope"
 
     # P2 wrong join key: both sides of an '=' are columns with mismatched type family
@@ -403,12 +411,131 @@ def explain(sql):
         conn.close()
 
 
+def explain_cost(sql):
+    """Fix #5: estimate query cost from the EXPLAIN plan and block execution if
+    it exceeds EXPLAIN_MAX_ROWS.
+
+    Returns (ok: bool, est_rows: int, reason: str).
+    Fails OPEN: on any parse error, returns (True, 0, 'parse fallback') —
+    never blocks a good query because we couldn't read the plan (P-3).
+    """
+    try:
+        conn = _mysql()
+    except Exception:
+        return True, 0, "MySQL unavailable — fail open"
+    try:
+        # Try JSON EXPLAIN first (richer data).
+        with conn.cursor() as cur:
+            try:
+                cur.execute("EXPLAIN FORMAT=JSON " + sql)
+                raw = cur.fetchone()
+                if raw:
+                    plan = json.loads(raw[0])
+                    est = _estimate_rows_json(plan)
+                    if est is not None:
+                        ok = est <= config.EXPLAIN_MAX_ROWS
+                        reason = "" if ok else (
+                            f"query too expensive (~{est:,} rows); "
+                            f"refusing to execute")
+                        return ok, est, reason
+            except Exception:
+                pass  # JSON parse failed — fall through to classic EXPLAIN
+
+            # Fallback: classic EXPLAIN (sum the rows column, flag type='ALL').
+            try:
+                cur.execute("EXPLAIN " + sql)
+                rows_list = cur.fetchall()
+                est, has_full_scan = _estimate_rows_classic(rows_list, cur.description)
+                if est is not None:
+                    ok = est <= config.EXPLAIN_MAX_ROWS
+                    reason = "" if ok else (
+                        f"query too expensive (~{est:,} rows"
+                        f"{', full table scan' if has_full_scan else ''}); "
+                        f"refusing to execute")
+                    return ok, est, reason
+            except Exception:
+                pass
+
+        # Both attempts failed → fail open.
+        return True, 0, "parse fallback"
+    finally:
+        conn.close()
+
+
+def _estimate_rows_json(plan):
+    """Walk the JSON EXPLAIN plan, summing rows_examined_per_scan /
+    rows_produced_per_join across nested tables. Returns total or None."""
+    try:
+        total = 0
+        qb = plan.get("query_block", plan)
+        tables = []
+        # Gather nested_loop / table entries.
+        for key in ("nested_loop", "ordering_operation", "table"):
+            if key in qb:
+                val = qb[key]
+                if isinstance(val, list):
+                    tables.extend(val)
+                elif isinstance(val, dict):
+                    tables.append(val)
+        # Also check inside ordering_operation / grouping_operation.
+        for wrapper_key in ("ordering_operation", "grouping_operation",
+                            "duplicates_removal"):
+            wrapper = qb.get(wrapper_key)
+            if isinstance(wrapper, dict):
+                nl = wrapper.get("nested_loop", [])
+                if isinstance(nl, list):
+                    tables.extend(nl)
+        if not tables:
+            return None
+        for entry in tables:
+            tbl = entry.get("table", entry)
+            rows = tbl.get("rows_examined_per_scan",
+                           tbl.get("rows_produced_per_join",
+                                   tbl.get("rows", 0)))
+            total += int(rows) if rows else 0
+        return total if total > 0 else None
+    except Exception:
+        return None
+
+
+def _estimate_rows_classic(rows_list, description):
+    """Sum the 'rows' column from classic EXPLAIN output. Also flag type='ALL'
+    (full table scan). Returns (total, has_full_scan) or (None, False)."""
+    try:
+        if not rows_list or not description:
+            return None, False
+        col_names = [d[0].lower() for d in description]
+        rows_idx = col_names.index("rows") if "rows" in col_names else None
+        type_idx = col_names.index("type") if "type" in col_names else None
+        if rows_idx is None:
+            return None, False
+        total = 0
+        has_full_scan = False
+        for row in rows_list:
+            r = row[rows_idx]
+            total += int(r) if r else 0
+            if type_idx is not None and str(row[type_idx]).upper() == "ALL":
+                has_full_scan = True
+        return total if total > 0 else None, has_full_scan
+    except Exception:
+        return None, False
+
+
 def execute(sql, max_rows=50):
     """Run the validated SELECT, return (columns, rows). Safe: validation already
-    guaranteed SELECT-only; we also cap rows."""
+    guaranteed SELECT-only; we also cap rows.
+
+    Fix #5: adds MAX_EXECUTION_TIME runtime cap as defense-in-depth."""
     conn = _mysql()
     try:
         with conn.cursor() as cur:
+            # Set runtime cap (defense-in-depth: bounds actual runtime even
+            # when the EXPLAIN row estimate was wrong).
+            try:
+                cur.execute("SET SESSION MAX_EXECUTION_TIME=%s",
+                            (config.QUERY_TIMEOUT_MS,))
+            except Exception:
+                pass  # older MySQL versions may not support this — degrade
             cur.execute(sql)
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchmany(max_rows)
@@ -417,10 +544,85 @@ def execute(sql, max_rows=50):
         conn.close()
 
 
+def _scalar_template(cols, rows):
+    """Fix #6 fast-path: if the result is exactly one row and one column, bypass
+    the LLM entirely and return a deterministic template."""
+    if len(cols) == 1 and len(rows) == 1:
+        val = rows[0][0]
+        if isinstance(val, (int, float)):
+            return f"The {cols[0].replace('_', ' ')} is {val:,}."
+        elif val is None:
+            return f"The {cols[0].replace('_', ' ')} is not available (null)."
+        return f"The {cols[0].replace('_', ' ')} is {val}."
+    return None
+
+
+def _extract_numbers(s):
+    """Pull numeric tokens out of any value's string form (handles thousands
+    separators like 1,234.5). Shared by the number-grounding guard."""
+    out = []
+    for m in re.finditer(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?", str(s)):
+        try:
+            out.append(float(m.group().replace(",", "")))
+        except ValueError:
+            pass
+    return out
+
+
+def _verify_numbers(text, cols, rows):
+    """Fix #6 guard: every number stated in the prose must be grounded in the
+    result rows. Returns True if grounded, False if the text states a number
+    that's absent from the data.
+
+    The grounding set is every number that appears ANYWHERE in the rows —
+    including digits embedded in string cells (dates, ids, versions). That breadth
+    is the fix for the original false-positive: a correct answer that mentions a
+    year or a date no longer trips the guard just because the cell was a string,
+    not an int. Rounding-tolerant; text with no numbers passes (nothing to fake)."""
+    text_nums = _extract_numbers(text)
+    if not text_nums:
+        return True
+    known = []
+    for r in rows:
+        for val in r:
+            if isinstance(val, (int, float)):
+                known.append(float(val))
+            else:
+                known.extend(_extract_numbers(val))
+    if not known:
+        return False  # prose states a number but the data has none -> fail
+    for tn in text_nums:
+        if not any(abs(tn - kn) < 0.1 or (tn != 0 and abs(tn - kn) / abs(tn) < 0.05)
+                   for kn in known):
+            return False  # a stated number is grounded nowhere in the rows
+    return True
+
+
+def _render_rows(cols, rows, limit=10):
+    """Fix #6 safe fallback: a deterministic, truthful rendering of the result
+    rows. Used when the LLM's prose can't be number-verified — we degrade to the
+    actual data, never an apology and never a blocked answer (P-3: degrade, not
+    block). No model call, so it can't hallucinate."""
+    if not rows:
+        return "The query returned no rows."
+    header = " | ".join(str(c) for c in cols)
+    lines = [" | ".join(str(v) for v in r) for r in rows[:limit]]
+    more = f"\n(+{len(rows) - limit} more row(s))" if len(rows) > limit else ""
+    return ("Here is the result (the generated summary couldn't be verified, so "
+            f"showing the data directly):\n{header}\n" + "\n".join(lines) + more)
+
+
 def compose_answer(question, cols, rows):
-    """Turn result rows into a short English answer (llama3.1)."""
+    """Turn result rows into a short English answer (llama3.1).
+    Fix #6: guarded with scalar fast-path and numeric hallucination check."""
     if not rows:
         return "The query ran successfully but returned no rows (no matching data)."
+
+    # Fast path for scalar results (no LLM, no hallucinations, 0 latency).
+    scalar = _scalar_template(cols, rows)
+    if scalar:
+        return scalar
+
     preview = [dict(zip(cols, r)) for r in rows[:10]]
     prompt = (
         "Answer the user's question in 1-2 plain sentences using ONLY these SQL "
@@ -432,7 +634,14 @@ def compose_answer(question, cols, rows):
     try:
         resp = ollama.generate(model=config.OLLAMA_ANSWER_MODEL, prompt=prompt)
         _record_tokens("answer compose (llama3.1)", resp)
-        return re.sub(r"<think>.*?</think>", "", resp["response"], flags=re.DOTALL).strip()
+        text = re.sub(r"<think>.*?</think>", "", resp["response"], flags=re.DOTALL).strip()
+
+        # Guard: did the LLM hallucinate a number? If so, degrade to the actual
+        # rows (truthful) instead of returning an unverifiable sentence (Fix #6).
+        if not _verify_numbers(text, cols, rows):
+            return _render_rows(cols, rows)
+
+        return text
     except Exception as exc:
         return f"(could not compose a sentence: {exc}) - see rows above."
 

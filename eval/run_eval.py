@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import config
-import ask
+import graph as engine          # v2: the LangGraph port (drop-in twin of ask.answer)
 import pymysql
 
 GOLD = Path(__file__).resolve().parent / "gold.jsonl"
@@ -80,7 +80,7 @@ def grade_item(g, cur, model):
          "correct": False}
 
     wall = time.time()
-    tr = ask.answer(g["question"], sql_model=model, compose=False)
+    tr = engine.answer(g["question"], sql_model=model, compose=False)
     r["seconds"] = round(time.time() - wall, 2)
     r["tokens"] = sum((e.get("in") or 0) + (e.get("out") or 0) for e in tr["tokens"])
 
@@ -90,7 +90,10 @@ def grade_item(g, cur, model):
         r["fail_stage"] = "" if r["correct"] else "should_have_rejected"
         return r
     if g["expected"] == "clarify":
-        r["correct"] = bool(tr["low_confidence"]) or (tr["in_scope"] is False)
+        # correct iff the pipeline didn't confidently guess: it either paused to
+        # ask (M3 interrupt), flagged low retrieval confidence, or refused.
+        r["correct"] = (bool(tr.get("needs_clarification")) or bool(tr["low_confidence"])
+                        or (tr["in_scope"] is False))
         r["fail_stage"] = "" if r["correct"] else "answered_confidently"
         return r
 
@@ -129,7 +132,6 @@ def grade_item(g, cur, model):
 
 def main():
     model = sys.argv[1] if len(sys.argv) > 1 else config.OLLAMA_SQL_MODEL
-    ask.TOKEN_STATS["enabled"] = True
     items = [json.loads(l) for l in GOLD.read_text(encoding="utf-8").splitlines() if l.strip()]
     conn = pymysql.connect(host=config.MYSQL_HOST, port=config.MYSQL_PORT,
                            user=config.MYSQL_USER, password=config.MYSQL_PASSWORD,
