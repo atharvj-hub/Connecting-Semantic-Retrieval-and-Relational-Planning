@@ -145,11 +145,11 @@ CACHE_VOLATILE_PATTERNS = {
 }
 
 # Override: catalog/config tables are stable even if a volatile pattern matched.
+# These are illustrative names — edit them to match your own schema's lookup tables.
 CACHE_STABLE_TABLES = {
-    "plans", "plan_parameter_configs", "plan_stripe_prices", "plugins",
-    "plugin_registrations", "platform_configs", "billing_parameters",
-    "credential_types", "promo_codes", "referral_codes", "trusted_publishers",
-    "tenants", "workspaces",
+    "plans", "plan_configs", "products", "product_categories",
+    "config_settings", "pricing_tiers", "countries", "currencies",
+    "roles", "permissions", "feature_flags",
 }
 
 # ---------------------------------------------------------------------------
